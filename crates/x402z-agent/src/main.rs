@@ -279,7 +279,9 @@ async fn cmd_pay() {
         a.reason = Some(format!("allowed, but not paid: {why}"));
         ledger.upsert_agent(&agent, &policy, spent_before);
         ledger.append(a);
-        let _ = ledger.save();
+        if let Err(e) = ledger.save() {
+            eprintln!("warning: could not save the spend ledger: {e}");
+        }
     };
     let (mut client, tip) = connect_lwd().await;
     let dir = wallet_dir();
@@ -332,7 +334,16 @@ async fn cmd_pay() {
     let receipt = loop {
         let r = http.post(&verify_url).json(&body).send().await;
         let v: Option<VerifyResponse> = match r {
-            Ok(r) => r.json().await.ok(),
+            Ok(r) => {
+                let code = r.status();
+                match r.json().await {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("facilitator {verify_url} answered {code} with an unreadable body: {e}");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("facilitator {verify_url} unreachable: {e}");
                 None

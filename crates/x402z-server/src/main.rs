@@ -32,6 +32,18 @@ const MAX_EVENTS: usize = 200;
 const DEFAULT_CHALLENGE_RATE_PER_MIN: u32 = 30;
 /// Forget idle buckets once the table grows past this many client IPs.
 const MAX_TRACKED_IPS: usize = 10_000;
+/// Hard cap on unexpired open challenges across all clients, so many distinct IPs can't grow
+/// `Book.open` without bound either (each one lives for CHALLENGE_TTL_SECS).
+const MAX_OPEN_CHALLENGES: usize = 100_000;
+
+/// Bucket key: IPv4 address, or the /64 prefix for IPv6 (one host usually owns a whole /64,
+/// so per-address buckets would hand it 2^64 budgets).
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+    }
+}
 
 fn require(var: &str) -> String {
     match std::env::var(var) {
@@ -120,9 +132,14 @@ impl ChallengeLimiter {
         }
         let cap = f64::from(self.per_min);
         let per_sec = cap / 60.0;
+        let ip = bucket_key(ip);
         if self.buckets.len() >= MAX_TRACKED_IPS && !self.buckets.contains_key(&ip) {
             // Drop buckets that have refilled completely; they carry no state worth keeping.
             self.buckets.retain(|_, (tokens, at)| *tokens + now.saturating_duration_since(*at).as_secs_f64() * per_sec < cap);
+            if self.buckets.len() >= MAX_TRACKED_IPS {
+                // Every tracked client is still mid-burst: refuse new clients rather than grow the table.
+                return Err(Duration::from_secs_f64(1.0 / per_sec));
+            }
         }
         let (tokens, at) = self.buckets.entry(ip).or_insert((cap, now));
         *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * per_sec).min(cap);
@@ -241,6 +258,12 @@ fn payment_required(ch: PaymentRequired, error: Option<String>) -> Response {
 async fn quote(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
     // Rate-limits every path that mints a new challenge (first request and re-issue after a rejected receipt).
     let limit = |book: &mut Book| -> Result<(), Response> {
+        let now_unix = now();
+        book.open.retain(|_, ch| ch.expires_at > now_unix);
+        if book.open.len() >= MAX_OPEN_CHALLENGES {
+            book.push("rejected", None, None, None, format!("open challenge table full; refused {}", peer.ip()));
+            return Err(too_many_challenges(Duration::from_secs(60)));
+        }
         app.limiter.lock().unwrap().try_acquire(peer.ip(), Instant::now()).map_err(|wait| {
             book.push("rejected", None, None, None, format!("rate limited {} (retry in {}s)", peer.ip(), wait.as_secs().max(1)));
             too_many_challenges(wait)
@@ -525,6 +548,35 @@ mod tests {
             l.try_acquire(ip(1), later).unwrap();
         }
         assert!(l.try_acquire(ip(1), later).is_err());
+    }
+
+    #[test]
+    fn limiter_table_is_bounded_under_many_active_clients() {
+        let mut l = ChallengeLimiter::new(30);
+        let t0 = Instant::now();
+        for i in 0..(MAX_TRACKED_IPS as u32 + 500) {
+            let _ = l.try_acquire(IpAddr::from(i.to_be_bytes()), t0);
+        }
+        assert_eq!(l.buckets.len(), MAX_TRACKED_IPS);
+        // a new client is refused (not tracked) while the table is full of active buckets
+        assert!(l.try_acquire(IpAddr::from([203, 0, 113, 9]), t0).is_err());
+        assert_eq!(l.buckets.len(), MAX_TRACKED_IPS);
+        // once buckets refill they are evicted and new clients get in
+        assert_eq!(l.try_acquire(IpAddr::from([203, 0, 113, 9]), t0 + Duration::from_secs(61)), Ok(()));
+    }
+
+    #[test]
+    fn limiter_groups_ipv6_by_64_prefix() {
+        let mut l = ChallengeLimiter::new(2);
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::7".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(l.try_acquire(a, t0), Ok(()));
+        assert_eq!(l.try_acquire(b, t0), Ok(()));
+        assert!(l.try_acquire(a, t0).is_err());
+        assert_eq!(l.try_acquire(other, t0), Ok(()));
+        assert_eq!(l.buckets.len(), 2);
     }
 
     #[test]
